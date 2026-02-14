@@ -1,9 +1,9 @@
 fastapi
 uvicorn
 sqlalchemy
-psycopg2-binary
-asyncpg
 databases
+asyncpg
+psycopg2-binary
 pydantic
 python-multipart
 cors
