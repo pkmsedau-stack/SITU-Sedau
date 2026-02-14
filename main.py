@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import databases
@@ -10,31 +9,38 @@ from pydantic import BaseModel
 from datetime import datetime
 
 # --- KONFIGURASI DATABASE ---
-raw_uri = os.getenv("DATABASE_URL")
+raw_uri = os.getenv("DATABASE_URL", "").strip()
 
 if not raw_uri:
-    # Fallback untuk pengembangan lokal
-    DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/situ_db"
+    print("WARNING: DATABASE_URL tidak ditemukan, menggunakan SQLite untuk fallback (Hanya untuk testing local!)")
+    DATABASE_URL = "sqlite:///./test.db"
+    SYNC_DATABASE_URL = DATABASE_URL
 else:
-    # 1. Transformasi protokol untuk library 'databases' asinkron
+    # 1. Perbaiki Protokol untuk Driver ASINKRON (asyncpg)
     if raw_uri.startswith("postgres://"):
-        DATABASE_URL = raw_uri.replace("postgres://", "postgresql+asyncpg://", 1)
+        async_uri = raw_uri.replace("postgres://", "postgresql+asyncpg://", 1)
     elif raw_uri.startswith("postgresql://"):
-        DATABASE_URL = raw_uri.replace("postgresql://", "postgresql+asyncpg://", 1)
+        async_uri = raw_uri.replace("postgresql://", "postgresql+asyncpg://", 1)
     else:
-        DATABASE_URL = raw_uri
+        async_uri = raw_uri
 
-    # 2. PAKSA mode SSL (Wajib untuk Railway PostgreSQL)
-    if "sslmode" not in DATABASE_URL:
-        connector = "&" if "?" in DATABASE_URL else "?"
-        DATABASE_URL += f"{connector}sslmode=require"
+    # 2. Tambahkan SSL Mode jika belum ada (Wajib untuk Cloud DB)
+    if "sslmode" not in async_uri:
+        connector = "&" if "?" in async_uri else "?"
+        async_uri += f"{connector}sslmode=require"
+    
+    DATABASE_URL = async_uri
+    # URL Sinkron untuk SQLAlchemy create_all (psycopg2)
+    SYNC_DATABASE_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
+print(f"DATABASE_URL (Masked): {DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else 'Local/SQLite'}")
+
+# Inisialisasi Database asinkron
+# Jika di cloud, kita paksa penggunaan SSL melalui argument
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
 
 # --- DEFINISI TABEL ---
-
-# 1. Tabel Pegawai
 pegawai = sqlalchemy.Table(
     "pegawai",
     metadata,
@@ -52,7 +58,6 @@ pegawai = sqlalchemy.Table(
     sqlalchemy.Column("mkg_bulan", sqlalchemy.Integer, default=0),
 )
 
-# 2. Tabel Buku Tamu
 guests = sqlalchemy.Table(
     "guests",
     metadata,
@@ -67,7 +72,6 @@ guests = sqlalchemy.Table(
     sqlalchemy.Column("status", sqlalchemy.String, default="Menunggu"),
 )
 
-# 3. Tabel Audit Log
 audit_logs = sqlalchemy.Table(
     "audit_logs",
     metadata,
@@ -77,19 +81,45 @@ audit_logs = sqlalchemy.Table(
     sqlalchemy.Column("timestamp", sqlalchemy.String),
 )
 
-# 4. Tabel Settings TU
-settings = sqlalchemy.Table(
-    "settings",
-    metadata,
-    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column("namaPuskesmas", sqlalchemy.String),
-    sqlalchemy.Column("namaKepala", sqlalchemy.String),
-    sqlalchemy.Column("nipKepala", sqlalchemy.String),
-    sqlalchemy.Column("jabatanKepala", sqlalchemy.String),
-    sqlalchemy.Column("formatNomor", sqlalchemy.String),
+# --- APP INITIALIZATION ---
+app = FastAPI(title="SITU Backend v2.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# --- MODELS (PYDANTIC) ---
+@app.on_event("startup")
+async def startup():
+    print("Startup: Memulai inisialisasi aplikasi...")
+    try:
+        # Step 1: Inisialisasi Tabel (Sinkron)
+        print("Startup: Mencoba membuat tabel (SQLAlchemy Sync)...")
+        engine = sqlalchemy.create_engine(
+            SYNC_DATABASE_URL, 
+            connect_args={"connect_timeout": 10} # Timeout agar tidak hang selamanya
+        )
+        metadata.create_all(engine)
+        print("Startup: Tabel berhasil diverifikasi/dibuat.")
+        
+        # Step 2: Connect Asinkron
+        print("Startup: Menghubungkan database asinkron (databases + asyncpg)...")
+        await database.connect()
+        print("Startup: DATABASE CONNECTED SUCCESSFULLY.")
+    except Exception as e:
+        print(f"STARTUP CRITICAL ERROR: {type(e).__name__} - {e}")
+        # Jangan biarkan aplikasi hang, biarkan lanjut tapi log error-nya jelas
+        pass
+
+@app.on_event("shutdown")
+async def shutdown():
+    if database.is_connected:
+        await database.disconnect()
+        print("Shutdown: Database disconnected.")
+
+# --- MODELS ---
 class PegawaiIn(BaseModel):
     nip: str
     nama: str
@@ -103,69 +133,22 @@ class PegawaiIn(BaseModel):
     mkg_tahun: Optional[int] = 0
     mkg_bulan: Optional[int] = 0
 
-class LoginIn(BaseModel):
-    nip: str
-    pin: str
-
 class AuditIn(BaseModel):
     aktivitas: str
 
-# --- APP INITIALIZATION ---
-app = FastAPI(title="SITU Backend - Railway Pro")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("startup")
-async def startup():
-    try:
-        # Inisialisasi tabel menggunakan engine sinkron (tanpa +asyncpg)
-        sync_url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
-        engine = sqlalchemy.create_engine(sync_url)
-        metadata.create_all(engine)
-        
-        # Connect ke database asinkron
-        await database.connect()
-        print("Backend: Berhasil terhubung ke PostgreSQL Railway")
-    except Exception as e:
-        print(f"CRITICAL ERROR (DB): {e}")
-        # Tetap jalankan app agar healthcheck bisa diakses dari frontend
-        pass
-
-@app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
-
 # --- ENDPOINTS ---
-
 @app.get("/api/v1/health")
 async def health():
-    db_status = "connected" if database.is_connected else "disconnected"
     return {
         "status": "online",
-        "database": db_status,
-        "timestamp": datetime.now().isoformat()
+        "database": "connected" if database.is_connected else "error",
+        "environment": "railway" if os.getenv("RAILWAY_ENVIRONMENT") else "local"
     }
 
-@app.post("/api/v1/auth/login")
-async def login(data: LoginIn):
-    # Simulasi login (Di produksi gunakan hash password/PIN)
-    if data.pin == "123456" or data.nip == "197801012005011002":
-        return {
-            "nip": data.nip,
-            "nama": "Administrator SITU",
-            "role": "Admin",
-            "accessToken": str(uuid.uuid4())
-        }
-    raise HTTPException(status_code=401, detail="NIP atau PIN salah.")
-
-# Pegawai CRUD
 @app.get("/api/v1/pegawai")
 async def get_pegawai():
+    if not database.is_connected:
+        raise HTTPException(status_code=503, detail="Database connection is not active.")
     query = pegawai.select()
     return await database.fetch_all(query)
 
@@ -176,57 +159,14 @@ async def create_pegawai(data: PegawaiIn):
     await database.execute(query)
     return {**data.dict(), "id": item_id}
 
-@app.put("/api/v1/pegawai/{nip}")
-async def update_pegawai(nip: str, data: PegawaiIn):
-    query = pegawai.update().where(pegawai.c.nip == nip).values(**data.dict())
-    await database.execute(query)
-    return data
-
-@app.delete("/api/v1/pegawai/{nip}")
-async def delete_pegawai(nip: str):
-    query = pegawai.delete().where(pegawai.c.nip == nip)
-    await database.execute(query)
-    return {"status": "deleted"}
-
-# Audit Log
-@app.get("/api/v1/audit")
-async def get_audit():
-    query = audit_logs.select().order_by(audit_logs.c.timestamp.desc())
-    return await database.fetch_all(query)
-
 @app.post("/api/v1/audit")
 async def create_audit(data: AuditIn):
     item_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
-    query = audit_logs.insert().values(
-        id=item_id, 
-        admin="Admin", 
-        aktivitas=data.aktivitas, 
-        timestamp=now
-    )
+    query = audit_logs.insert().values(id=item_id, admin="Admin", aktivitas=data.aktivitas, timestamp=now)
     await database.execute(query)
     return {"id": item_id, "admin": "Admin", "aktivitas": data.aktivitas, "timestamp": now}
 
-# e-Tamu CRUD
-@app.get("/api/v1/guests")
-async def get_guests():
-    query = guests.select().order_by(guests.c.tanggal.desc())
-    return await database.fetch_all(query)
-
-@app.post("/api/v1/guests")
-async def create_guest(data: dict):
-    item_id = str(uuid.uuid4())
-    query = guests.insert().values(id=item_id, **data)
-    await database.execute(query)
-    return {**data, "id": item_id}
-
-@app.patch("/api/v1/guests/{id}/status")
-async def update_guest_status(id: str, data: dict):
-    query = guests.update().where(guests.c.id == id).values(status=data['status'])
-    await database.execute(query)
-    return {"status": "updated"}
-
-# Root redirect ke health
 @app.get("/")
 async def root():
-    return {"app": "SITU Backend", "version": "2.0", "docs": "/docs"}
+    return {"message": "SITU API is Running", "docs": "/docs"}
